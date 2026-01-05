@@ -12,7 +12,9 @@ def extract_text_from_file(uploaded_file):
     try:
         if uploaded_file.type in ['image/png', 'image/jpeg']:
             image = Image.open(uploaded_file)
-            return pytesseract.image_to_string(image, lang='kor+eng')
+            # --psm 6: 이미지 내 텍스트를 하나의 균일한 블록으로 간주하여 줄바꿈 인식률 향상
+            custom_config = r'--oem 3 --psm 6'
+            return pytesseract.image_to_string(image, lang='kor+eng', config=custom_config)
         elif uploaded_file.type == 'application/pdf':
             full_text = ""
             with pdfplumber.open(uploaded_file) as pdf:
@@ -27,65 +29,57 @@ def extract_text_from_file(uploaded_file):
 def parse_export_data(text, filename):
     data = {"파일명": filename}
     
-    # 1. 수출신고번호 (패턴 강화)
-    match_sin_go = re.search(r'(\d{5}-\d{2}-\d{6}[A-Z])', text)
+    # OCR 텍스트 전처리: 여러 개의 공백을 하나로 합침
+    clean_text = " ".join(text.split())
+
+    # 1. 수출신고번호
+    match_sin_go = re.search(r'(\d{5}-\d{2}-\d{6}[A-Z])', clean_text)
     data['수출신고번호'] = match_sin_go.group(1) if match_sin_go else "미확인"
     
     # 2. 거래구분
-    match_trade = re.search(r'거래구분\s*[:：]?\s*(\d{2})', text)
-    trade_code = match_trade.group(1) if match_trade else "11" # 이미지에 11이 보이면 기본값 11
-    data['거래구분'] = trade_code
-    
-    # 3. 모델·규격 추출 (가장 중요한 수정)
-    # '거래품명' 이후부터 '세번부호' 또는 '순중량' 이전까지의 모든 텍스트를 가져옵니다.
-    # 기호 ㉚ 대신 텍스트 키워드 기반으로 범위를 넓혔습니다.
-    model_area = ""
-    model_match = re.search(r'(?:거래품명|모델\s*·?\s*규격)(.*?)(?=세번부호|순중량|㊱|㉜)', text, re.S | re.I)
-    if model_match:
-        model_area = model_match.group(1).strip()
-    else:
-        # 만약 위 패턴이 실패하면 'FREE OF CHARGE' 주변 텍스트라도 가져옵니다.
-        foc_context = re.search(r'(.{20}FREE OF CHARGE.{20})', text, re.S | re.I)
-        model_area = foc_context.group(1).strip() if foc_context else ""
-    
-    data['모델ㆍ규격'] = model_area.replace('\n', ' ')
+    match_trade = re.search(r'거래구분\s*[:：]?\s*(\d{2})', clean_text)
+    data['거래구분'] = match_trade.group(1) if match_trade else "11"
 
-    # 4. 수량(단위)
-    # 이미지처럼 1 (BO) 형식을 찾음
-    match_qty = re.search(r'([\d,.]+)\s*(\([A-Z]{2,3}\))', text)
+    # 3. 모델·규격 (헤더 및 노이즈 제거)
+    # 이미지 샘플처럼 (NO.01)로 시작하고 FOC 문구로 끝나는 실제 값만 타겟팅
+    model_match = re.search(r'(\(NO\.\d+\).*?FREE OF CHARGE.*?\))', clean_text, re.I)
+    if model_match:
+        data['모델ㆍ규격'] = model_match.group(1)
+    else:
+        # 패턴이 잡히지 않을 경우 'FREE OF CHARGE' 주변 60자 캡처
+        foc_fallback = re.search(r'(.{0,40}FREE OF CHARGE.{0,40})', clean_text, re.I)
+        data['모델ㆍ규격'] = foc_fallback.group(1).strip() if foc_fallback else "텍스트 확인 불가"
+
+    # 4. 수량(단위) - ㉜항목
+    match_qty = re.search(r'(\d+)\s*(\([A-Z]{2,3}\))', clean_text)
     data['수량(단위)'] = f"{match_qty.group(1)} {match_qty.group(2)}" if match_qty else "미확인"
 
-    # 5. 순중량
-    match_net = re.search(r'([\d,.]+)\s*\(KG\)', text, re.I)
+    # 5. 순중량 - ㊱항목
+    match_net = re.search(r'([\d,.]+)\s*\(KG\)', clean_text, re.I)
     data['순중량'] = f"{match_net.group(1)} KG" if match_net else "미확인"
 
-    # 6. 신고가격(FOB) (이미지의 $ 표시 대응)
-    # $ 뒤에 숫자가 오는 패턴을 먼저 찾습니다.
-    match_fob = re.search(r'(\$\s?[\d,.]+)', text)
-    if not match_fob:
-        match_fob = re.search(r'㊳?\s*신고가격\(FOB\)\s*([\d,.]+)', text)
-    data['신고가격(FOB)'] = match_fob.group(1) if match_fob else "미확인"
+    # 6. 신고가격(FOB) - ㊳항목 ($ 금액 우선 추출)
+    fob_match = re.search(r'(\$\s?[\d,.]+)', clean_text)
+    data['신고가격(FOB)'] = fob_match.group(1) if fob_match else "미확인"
 
-    # 7. FOC 판별 (전체 텍스트에서 키워드 검색으로 안전하게)
-    is_foc = False
-    if "FREE OF CHARGE" in text.upper() or "F.O.C" in text.upper():
-        if not any(ex in text.upper() for ex in ['CANISTER', 'DRUM']):
-            is_foc = True
-                
-    data['FOC여부'] = is_foc
+    # 7. FOC 판별 (대소문자 무시)
+    data['FOC여부'] = True if "FREE OF CHARGE" in clean_text.upper() else False
+    
     return data
 
 def main():
     st.title('📦 수출신고필증 FOC(무상) 항목 추출기')
-    st.markdown("### 샘플 이미지의 ㉚모델·규격 및 ㊳신고가격 정보를 정밀 분석합니다.")
+    st.info("PSM 6 옵션이 적용되어 표 안의 텍스트 인식률을 개선했습니다.")
 
     with st.sidebar:
         st.header("파일 업로드")
-        uploaded_files = st.file_uploader("파일을 업로드하세요", type=['png', 'jpg', 'jpeg', 'pdf'], accept_multiple_files=True)
+        uploaded_files = st.file_uploader("이미지 또는 PDF 업로드", 
+                                         type=['png', 'jpg', 'jpeg', 'pdf'], 
+                                         accept_multiple_files=True)
 
     if uploaded_files:
         all_results = []
-        with st.spinner("이미지 텍스트 판독 중..."):
+        with st.spinner("텍스트 판독 및 데이터 매칭 중..."):
             for uploaded_file in uploaded_files:
                 text = extract_text_from_file(uploaded_file)
                 if text:
@@ -95,23 +89,22 @@ def main():
             df_all = pd.DataFrame(all_results)
             df_foc = df_all[df_all['FOC여부'] == True].copy()
 
-            st.subheader("✅ FOC 추출 결과")
+            st.subheader("✅ FOC 추출 리스트")
             if not df_foc.empty:
                 cols = ['파일명', '수출신고번호', '거래구분', '모델ㆍ규격', '수량(단위)', '순중량', '신고가격(FOB)']
                 st.dataframe(df_foc[cols], use_container_width=True, hide_index=True)
                 
-                # 엑셀 다운로드
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                     df_foc[cols].to_excel(writer, index=False)
-                st.download_button("엑셀 파일 다운로드", output.getvalue(), "FOC_Analysis.xlsx")
+                st.download_button("결과 다운로드 (Excel)", output.getvalue(), "FOC_List.xlsx")
             else:
-                st.warning("FOC 건을 찾지 못했습니다. [전체 데이터 보기]를 통해 인식 내용을 확인하세요.")
+                st.warning("FOC 건이 발견되지 않았습니다.")
 
-            with st.expander("🔍 전체 데이터 분석 결과 (인식 오류 확인용)"):
+            with st.expander("🔍 전체 분석 텍스트 데이터 확인"):
                 st.dataframe(df_all)
     else:
-        st.info("왼쪽 사이드바에서 분석할 필증 이미지를 업로드해 주세요.")
+        st.info("왼쪽에서 파일을 선택해 주세요.")
 
 if __name__ == '__main__':
     main()
