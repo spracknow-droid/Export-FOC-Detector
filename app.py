@@ -8,9 +8,6 @@ import re
 
 st.set_page_config(layout="wide", page_title="수출신고필증 FOC 추출기")
 
-# Tesseract 경로 설정 (로컬 실행 시 필요할 수 있음)
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
 def extract_text_from_file(uploaded_file):
     """파일 유형에 따라 텍스트 추출"""
     try:
