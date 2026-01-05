@@ -29,32 +29,41 @@ def parse_export_data(text, filename):
     """텍스트에서 필요한 정보 추출 및 FOC 판별"""
     data = {"파일명": filename}
     
-    # 1. 신고번호
+    # 전체 텍스트를 대문자로 변환 (비교를 쉽게 하기 위함)
+    upper_text = text.upper()
+    
+    # 1. 신고번호 추출
     match_sin_go = re.search(r'\b(\d{5}-\d{2}-\d{6}[A-Z])\b', text)
     data['신고번호'] = match_sin_go.group(1) if match_sin_go else "미확인"
     
-    # 2. 거래구분 (숫자 2자리 추출)
+    # 2. 거래구분 추출 (숫자 2자리)
     match_trade = re.search(r'거래구분\s*[:：]?\s*(\d{2})', text)
     trade_code = match_trade.group(1) if match_trade else ""
     data['거래구분'] = trade_code
     
-    # 3. 품명 (전체 텍스트에서 품명 부분 추출)
-    match_item = re.search(r'품 명\s*[:：]?\s*(.*?)\s*29', text, re.S)
-    item_name = match_item.group(1).strip() if match_item else ""
-    data['품명'] = item_name
+    # 3. 품명 및 규격 추출 (범위를 더 넓게 잡음)
+    # 품명(28번)부터 검사사항(30번) 이전까지의 내용을 최대한 긁어옴
+    match_item = re.search(r'품\s*명\s*[:：]?\s*(.*?)\s*(?:29|30|검사사항)', text, re.S | re.I)
+    item_content = match_item.group(1).strip() if match_item else ""
+    data['품명'] = item_content
 
-    # 4. FOC 여부 판별 로직
-    # 조건: 거래구분이 11이고, 품명에 FOC(무상) 관련 키워드가 있는가?
-    # 예외: Canister, Drum 등 재수입 용기는 제외
+    # 4. FOC 여부 판별 로직 (강화됨)
     is_foc = False
-    foc_keywords = ['F.O.C', 'FREE OF CHARGE', 'NO CHARGE', 'SAMPLES']
-    exclude_keywords = ['CANISTER', 'DRUM', 'RE-IMPORT']
+    
+    # 무상 키워드 리스트 (인식 오차를 대비해 핵심 단어 위주로 구성)
+    foc_keywords = ['FREE OF CHARGE', 'F.O.C', 'NO CHARGE', 'FOC', '무상']
+    exclude_keywords = ['CANISTER', 'DRUM', 'RE-IMPORT', '재수입']
 
     if trade_code == "11":
-        # 품명에서 무상 키워드 확인 (대소문자 구분 없음)
-        if any(key in item_name.upper() for key in foc_keywords):
-            # 제외 키워드가 포함되어 있는지 확인
-            if not any(ex in item_name.upper() for ex in exclude_keywords):
+        # 방법 1: 품명 섹션 안에서 찾기
+        found_in_item = any(key in item_content.upper() for key in foc_keywords)
+        
+        # 방법 2: 품명에서 못 찾았다면 문서 전체에서 다시 한 번 확인 (더 확실함)
+        found_in_full_text = any(key in upper_text for key in foc_keywords)
+        
+        if found_in_item or found_in_full_text:
+            # 제외 키워드가 포함되어 있는지 확인 (전체 텍스트 기준)
+            if not any(ex in upper_text for ex in exclude_keywords):
                 is_foc = True
     
     data['FOC여부'] = is_foc
