@@ -12,7 +12,6 @@ def extract_text_from_file(uploaded_file):
     try:
         if uploaded_file.type in ['image/png', 'image/jpeg']:
             image = Image.open(uploaded_file)
-            # PSM 6: 표 형식의 데이터를 줄 단위로 읽는 데 최적화
             return pytesseract.image_to_string(image, lang='kor+eng', config=r'--oem 3 --psm 6')
         elif uploaded_file.type == 'application/pdf':
             full_text = ""
@@ -26,112 +25,92 @@ def extract_text_from_file(uploaded_file):
         return ""
 
 def parse_lan_segments(text, filename):
-    results = []
-    # 공백 정규화
-    clean_full_text = " ".join(text.split())
+    # 1. 문서 전체에서 줄바꿈 제거 (한 줄로 인식률 극대화)
+    clean_text = " ".join(text.split())
     
-    # 공통 정보: 수출신고번호
-    match_sin_go = re.search(r'(\d{5}-\d{2}-\d{6}[A-Z])', clean_full_text)
+    # 2. 공통 정보 (신고번호) - 문서에 한 번만 나옴
+    match_sin_go = re.search(r'(\d{5}-\d{2}-\d{6}[A-Z])', clean_text)
     sin_go_no = match_sin_go.group(1) if match_sin_go else "미확인"
 
-    # 란별 섹션 나누기: "품명 · 규격" 키워드 기준
-    sections = re.split(r'품\s*명\s*[·\.]?\s*규\s*격', text, flags=re.I)
+    # 3. [핵심] 란 번호 기호를 기준으로 텍스트를 통째로 쪼갭니다.
+    # 예: "(란번호/총란수 : 001/005)" 문구를 기준으로 나눔
+    lan_sections = re.split(r'\(란번호/총란수\s*:\s*', text)
     
-    for section in sections[1:]: # 헤더 이후의 각 란별 루프
-        data = {"파일명": filename, "수출신고번호": sin_go_no}
-        # 섹션 내 공백 정리
+    results = []
+    # 첫 번째 섹션은 공통 헤더이므로 제외하고, 두 번째 섹션부터가 실제 '란' 데이터입니다.
+    for section in lan_sections[1:]:
         s_clean = " ".join(section.split())
+        data = {"파일명": filename, "수출신고번호": sin_go_no}
 
-        # 1. 란번호 (001/005 등에서 앞의 3자리)
-        lan_match = re.search(r'(\d{3})\s*/\s*\d{3}', s_clean)
+        # 란번호 추출 (001, 002 등)
+        lan_match = re.search(r'^(\d{3})', s_clean)
         data['란번호'] = lan_match.group(1) if lan_match else "미확인"
-
-        # 2. 거래구분 (기본값 11, 명시되어 있으면 추출)
-        trade_match = re.search(r'거래구분\s*[:：]?\s*(\d{2})', s_clean)
+        
+        # 거래구분 (필증 전체에서 찾거나 섹션 내에서 찾음)
+        trade_match = re.search(r'거래구분\s*[:：]?\s*(\d{2})', clean_text)
         data['거래구분'] = trade_match.group(1) if trade_match else "11"
 
-        # 3. 모델·규격 (핵심 데이터 추출)
-        # (NO.01) 시작 ~ FREE OF CHARGE 끝점을 정확히 캡처
-        model_match = re.search(r'(\(NO\.\d+\).*?FREE OF CHARGE.*?\))', s_clean, re.I)
-        if model_match:
-            data['모델ㆍ규격'] = model_match.group(1)
+        # 모델·규격 (해당 란 안에서 FREE OF CHARGE 문구 포함된 구역 추출)
+        # ㉚ 기호나 NO.01 등을 기준으로 캡처
+        model_part = re.search(r'(\(NO\.\d+\).*?FREE OF CHARGE.*?\))', s_clean, re.I)
+        if model_part:
+            data['모델ㆍ규격'] = model_part.group(1)
             data['FOC여부'] = True
         else:
-            # 보조 판별: 전체 문구 중 FOC가 있으면 일단 가져옴
-            is_foc = "FREE OF CHARGE" in s_clean.upper()
-            data['모델ㆍ규격'] = s_clean[:150] if is_foc else "FOC 아님"
-            data['FOC여부'] = is_foc
+            # FOC가 없는 란일 경우
+            data['모델ㆍ규격'] = "일반 품목"
+            data['FOC여부'] = False
 
-        # 4. 수량(단위)
+        # 수량, 순중량, 신고가격 추출
         qty_match = re.search(r'(\d[\d,.]*)\s*(\([A-Z]{2,3}\))', s_clean)
         data['수량(단위)'] = f"{qty_match.group(1)} {qty_match.group(2)}" if qty_match else "미확인"
 
-        # 5. 순중량
         weight_match = re.search(r'([\d,.]+)\s*\(KG\)', s_clean, re.I)
         data['순중량'] = f"{weight_match.group(1)} KG" if weight_match else "미확인"
 
-        # 6. 신고가격(FOB)
         fob_match = re.search(r'(\$\s?[\d,.]+)', s_clean)
-        data['신고가격(FOB)'] = fob_match.group(1) if fob_match else "미확인"
+        data['신고가격(FOB)'] = fob_match.group(0) if fob_match else "미확인"
 
         results.append(data)
+        
     return results
 
 def main():
     st.title('📦 수출신고필증 란별 FOC 추출기')
 
-    # --- 사이드바 영역 ---
     with st.sidebar:
         st.header("📂 파일 업로드")
-        uploaded_files = st.file_uploader(
-            "이미지 또는 PDF 파일을 선택하세요", 
-            type=['png', 'jpg', 'jpeg', 'pdf'], 
-            accept_multiple_files=True
-        )
-        st.divider()
-        st.info("💡 Tip: 란번호별로(001, 002...) FOC 항목을 자동 분류합니다.")
+        uploaded_files = st.file_uploader("파일 선택", type=['png', 'jpg', 'jpeg', 'pdf'], accept_multiple_files=True)
 
-    # --- 메인 영역 ---
     if uploaded_files:
-        all_data = []
-        progress_bar = st.progress(0)
+        all_rows = []
+        for file in uploaded_files:
+            text = extract_text_from_file(file)
+            if text:
+                # 파일 하나당 여러 개의 란(rows)이 나옵니다.
+                lan_rows = parse_lan_segments(text, file.name)
+                all_rows.extend(lan_rows)
         
-        for idx, file in enumerate(uploaded_files):
-            with st.status(f" 분석 중: {file.name}", expanded=False):
-                text = extract_text_from_file(file)
-                if text:
-                    lan_results = parse_lan_segments(text, file.name)
-                    all_data.extend(lan_results)
-            progress_bar.progress((idx + 1) / len(uploaded_files))
-        
-        if all_data:
-            df = pd.DataFrame(all_data)
-            # FOC여부가 True인 행만 필터링
+        if all_rows:
+            df = pd.DataFrame(all_rows)
+            # FOC 항목만 필터링해서 보여줌
             df_foc = df[df['FOC여부'] == True].copy()
 
-            st.subheader("✅ 란별 FOC 추출 결과")
+            st.subheader("✅ 추출된 FOC 리스트 (란별 분리 완료)")
+            cols = ['파일명', '수출신고번호', '란번호', '거래구분', '모델ㆍ규격', '수량(단위)', '순중량', '신고가격(FOB)']
+            
             if not df_foc.empty:
-                cols = ['파일명', '수출신고번호', '란번호', '거래구분', '모델ㆍ규격', '수량(단위)', '순중량', '신고가격(FOB)']
                 st.dataframe(df_foc[cols], use_container_width=True, hide_index=True)
                 
-                # 엑셀 다운로드 버튼
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                     df_foc[cols].to_excel(writer, index=False)
-                
-                st.download_button(
-                    label="📊 추출 결과 엑셀 다운로드",
-                    data=output.getvalue(),
-                    file_name="FOC_Detailed_List.xlsx",
-                    mime="application/vnd.ms-excel"
-                )
+                st.download_button("Excel 다운로드", output.getvalue(), "FOC_Detailed.xlsx")
             else:
-                st.warning("⚠️ FOC(FREE OF CHARGE) 키워드가 포함된 란을 찾지 못했습니다.")
+                st.warning("FOC 항목이 없습니다.")
                 
-            with st.expander("🔍 전체 분석 데이터 확인 (모든 란)"):
+            with st.expander("🔍 전체 란 데이터 보기"):
                 st.dataframe(df)
-    else:
-        st.info("사이드바에서 분석할 파일을 업로드해 주세요.")
 
 if __name__ == '__main__':
     main()
