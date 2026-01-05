@@ -29,9 +29,6 @@ def parse_export_data(text, filename):
     """텍스트에서 필요한 정보 추출 및 FOC 판별"""
     data = {"파일명": filename}
     
-    # 전체 텍스트를 대문자로 변환 (비교를 쉽게 하기 위함)
-    upper_text = text.upper()
-    
     # 1. 신고번호 추출
     match_sin_go = re.search(r'\b(\d{5}-\d{2}-\d{6}[A-Z])\b', text)
     data['신고번호'] = match_sin_go.group(1) if match_sin_go else "미확인"
@@ -41,32 +38,35 @@ def parse_export_data(text, filename):
     trade_code = match_trade.group(1) if match_trade else ""
     data['거래구분'] = trade_code
     
-    # 3. 품명 및 규격 추출 (범위를 더 넓게 잡음)
-    # 품명(28번)부터 검사사항(30번) 이전까지의 내용을 최대한 긁어옴
-    match_item = re.search(r'품\s*명\s*[:：]?\s*(.*?)\s*(?:29|30|검사사항)', text, re.S | re.I)
-    item_content = match_item.group(1).strip() if match_item else ""
-    data['품명'] = item_content
-
-    # 4. FOC 여부 판별 로직 (강화됨)
+    # 3. 모델·규격 및 품명 구역 집중 추출
+    # 보통 '품명'으로 시작해서 '결제금액'이나 '란' 번호 앞에서 끝나는 범위를 잡습니다.
+    # [ \n]은 공백이나 줄바꿈을 포함하여 검색한다는 의미입니다.
+    search_area_match = re.search(r'(?:품\s*명|모델\s*규격|거래품명).*?(?=결제금액|세액|란분할)', text, re.S | re.I)
+    search_area = search_area_match.group(0).upper() if search_area_match else text.upper()
+    
+    # 4. FOC 여부 판별 로직
     is_foc = False
     
-    # 무상 키워드 리스트 (인식 오차를 대비해 핵심 단어 위주로 구성)
+    # 핵심 키워드 (실제 OCR에서 'O'가 '0'으로 인식되는 경우 등도 대비 가능)
     foc_keywords = ['FREE OF CHARGE', 'F.O.C', 'NO CHARGE', 'FOC', '무상']
     exclude_keywords = ['CANISTER', 'DRUM', 'RE-IMPORT', '재수입']
 
     if trade_code == "11":
-        # 방법 1: 품명 섹션 안에서 찾기
-        found_in_item = any(key in item_content.upper() for key in foc_keywords)
+        # 1순위: 모델/규격 구역에서 확인
+        found_foc = any(key in search_area for key in foc_keywords)
         
-        # 방법 2: 품명에서 못 찾았다면 문서 전체에서 다시 한 번 확인 (더 확실함)
-        found_in_full_text = any(key in upper_text for key in foc_keywords)
-        
-        if found_in_item or found_in_full_text:
-            # 제외 키워드가 포함되어 있는지 확인 (전체 텍스트 기준)
-            if not any(ex in upper_text for ex in exclude_keywords):
+        if found_foc:
+            # 2순위: 제외 항목(Canister 등)이 해당 구역에 있는지 확인
+            is_excluded = any(ex in search_area for ex in exclude_keywords)
+            if not is_excluded:
                 is_foc = True
-    
+                
+    # UI에 보여줄 품명 정보 (간략화)
+    # 규격 내용이 너무 길면 표가 지저분해지므로 앞부분 50자만 추출
+    data['추출된_문구'] = search_area[:50].replace('\n', ' ') + "..."
+    data['거래구분'] = trade_code
     data['FOC여부'] = is_foc
+    
     return data
 
 def main():
