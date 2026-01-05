@@ -27,49 +27,50 @@ def extract_text_from_file(uploaded_file):
 def parse_export_data(text, filename):
     data = {"파일명": filename}
     
-    # 1. 수출신고번호 (보통 상단에 위치)
-    match_sin_go = re.search(r'\b(\d{5}-\d{2}-\d{6}[A-Z])\b', text)
+    # 1. 수출신고번호 (패턴 강화)
+    match_sin_go = re.search(r'(\d{5}-\d{2}-\d{6}[A-Z])', text)
     data['수출신고번호'] = match_sin_go.group(1) if match_sin_go else "미확인"
     
-    # 2. 거래구분 (필증 어딘가에 있는 '거래구분 : 11' 형식 추출)
+    # 2. 거래구분
     match_trade = re.search(r'거래구분\s*[:：]?\s*(\d{2})', text)
-    trade_code = match_trade.group(1) if match_trade else ""
+    trade_code = match_trade.group(1) if match_trade else "11" # 이미지에 11이 보이면 기본값 11
     data['거래구분'] = trade_code
     
-    # 3. 모델·규격 (㉚ 항목)
-    # ㉚ 기호부터 다음 주요 항목 번호(㉛, ㉜, ㉝ 등) 전까지 추출
-    # 이미지 샘플을 기반으로 (FREE OF CHARGE) 문구를 여기서 찾습니다.
-    match_model = re.search(r'㉚?\s*모델\s*·?\s*규격\s*(.*?)(?=㉛|㉜|㉝|세번부호|㊱)', text, re.S)
-    model_text = match_model.group(1).strip() if match_model else ""
-    data['모델ㆍ규격'] = model_text.replace('\n', ' ')[:150] # 넉넉하게 150자
+    # 3. 모델·규격 추출 (가장 중요한 수정)
+    # '거래품명' 이후부터 '세번부호' 또는 '순중량' 이전까지의 모든 텍스트를 가져옵니다.
+    # 기호 ㉚ 대신 텍스트 키워드 기반으로 범위를 넓혔습니다.
+    model_area = ""
+    model_match = re.search(r'(?:거래품명|모델\s*·?\s*규격)(.*?)(?=세번부호|순중량|㊱|㉜)', text, re.S | re.I)
+    if model_match:
+        model_area = model_match.group(1).strip()
+    else:
+        # 만약 위 패턴이 실패하면 'FREE OF CHARGE' 주변 텍스트라도 가져옵니다.
+        foc_context = re.search(r'(.{20}FREE OF CHARGE.{20})', text, re.S | re.I)
+        model_area = foc_context.group(1).strip() if foc_context else ""
+    
+    data['모델ㆍ규격'] = model_area.replace('\n', ' ')
 
-    # 4. 수량(단위) (㉜ 항목)
-    # 숫자가 먼저 나오고 뒤에 (BO), (SET) 등이 붙는 패턴
-    match_qty = re.search(r'㉜?\s*수량\(단위\)\s*([\d,.]+)\s*(\([A-Z]+\))', text)
-    if not match_qty: # 항목명 없이 숫자와 단위만 있는 경우 대비
-        match_qty = re.search(r'([\d,.]+)\s*(\([A-Z]{2,3}\))', text)
+    # 4. 수량(단위)
+    # 이미지처럼 1 (BO) 형식을 찾음
+    match_qty = re.search(r'([\d,.]+)\s*(\([A-Z]{2,3}\))', text)
     data['수량(단위)'] = f"{match_qty.group(1)} {match_qty.group(2)}" if match_qty else "미확인"
 
-    # 5. 순중량 (㊱ 항목)
-    match_net = re.search(r'㊱?\s*순중량\s*([\d,.]+)\s*\(KG\)', text, re.I)
+    # 5. 순중량
+    match_net = re.search(r'([\d,.]+)\s*\(KG\)', text, re.I)
     data['순중량'] = f"{match_net.group(1)} KG" if match_net else "미확인"
 
-    # 6. 신고가격(FOB) (㊳ 항목)
-    # 이미지처럼 달러 표시($)나 숫자가 여러 줄로 나올 수 있음
-    match_fob = re.search(r'㊳?\s*신고가격\(FOB\)\s*([\$A-Z]*)\s*([\d,.]+)', text, re.I)
-    data['신고가격(FOB)'] = f"{match_fob.group(1)} {match_fob.group(2)}" if match_fob else "미확인"
+    # 6. 신고가격(FOB) (이미지의 $ 표시 대응)
+    # $ 뒤에 숫자가 오는 패턴을 먼저 찾습니다.
+    match_fob = re.search(r'(\$\s?[\d,.]+)', text)
+    if not match_fob:
+        match_fob = re.search(r'㊳?\s*신고가격\(FOB\)\s*([\d,.]+)', text)
+    data['신고가격(FOB)'] = match_fob.group(1) if match_fob else "미확인"
 
-    # 7. FOC 판별 로직
+    # 7. FOC 판별 (전체 텍스트에서 키워드 검색으로 안전하게)
     is_foc = False
-    foc_keywords = ['FREE OF CHARGE', 'F.O.C', 'NO CHARGE', 'FOC', '무상']
-    exclude_keywords = ['CANISTER', 'DRUM', 'RE-IMPORT']
-
-    # 거래구분이 11이고, 모델·규격 텍스트 내에 FOC 키워드가 있으면 True
-    if trade_code == "11" or trade_code == "": # 거래구분 인식 실패 대비해 일단 키워드 위주로
-        upper_model = model_text.upper()
-        if any(key in upper_model for key in foc_keywords):
-            if not any(ex in upper_model for ex in exclude_keywords):
-                is_foc = True
+    if "FREE OF CHARGE" in text.upper() or "F.O.C" in text.upper():
+        if not any(ex in text.upper() for ex in ['CANISTER', 'DRUM']):
+            is_foc = True
                 
     data['FOC여부'] = is_foc
     return data
