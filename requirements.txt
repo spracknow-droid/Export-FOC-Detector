@@ -5,5 +5,3 @@ pandas
 pdfplumber
 openpyxl
 xlsxwriter
-io
-re
