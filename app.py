@@ -12,69 +12,80 @@ def parse_pdf_table(uploaded_file):
     
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
-            # 1. 텍스트에서 신고번호 먼저 추출
+            # 1. 신고번호 추출
             text = page.extract_text() or ""
             sin_go_match = re.search(r'(\d{5}-\d{2}-\d{6}[A-Z])', text)
             if sin_go_match:
                 current_sin_go_no = sin_go_match.group(1)
 
-            # 2. 표 추출 (선 기반 전략)
+            # 2. 표 추출 (표의 선이 겹치거나 끊겨도 최대한 인식하도록 설정)
             table = page.extract_table({
                 "vertical_strategy": "lines",
                 "horizontal_strategy": "lines",
-                "snap_tolerance": 3,
+                "snap_tolerance": 5, # 선 인식 허용치 상향
+                "join_tolerance": 5,
             })
 
-            if not table:
-                continue
+            if not table: continue
 
-            # 3. 데이터 파싱 (표의 각 행을 순회)
+            # 3. 유연한 데이터 매칭 로직
             for i, row in enumerate(table):
-                # None 값 제거 및 공백 정리
-                row = [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
-                
-                # '모델·규격' 칸이나 '(NO.01)' 같은 패턴이 보이면 데이터 행으로 간주
-                row_str = " ".join(row)
-                
-                if "(NO." in row_str:
-                    # 필증 양식에 따른 인덱스 추정 (전자 PDF 표 구조 기준)
-                    # [주의] 이 인덱스는 PDF 생성 엔진에 따라 1~2칸씩 차이날 수 있음
-                    try:
-                        model_info = row[0] # 보통 첫 번째 칸에 (NO.01) 모델명
-                        qty_info = row[2]   # 보통 세 번째 칸에 수량
-                        price_info = row[4] # 보통 다섯 번째 칸에 금액(USD)
-                        
-                        # FOC 판별 (FREE OF CHARGE 문구 확인)
-                        is_foc = "FREE OF CHARGE" in model_info.upper()
-                        # 제외 키워드
-                        exclude = any(ex in model_info.upper() for ex in ['CANISTER', 'CARRY BOX', 'DRUM'])
+                # 셀 내부 줄바꿈 처리 및 빈 값 제거
+                row = [str(cell).strip() if cell else "" for cell in row]
+                row_str = " ".join(row).replace('\n', ' ')
 
-                        if is_foc and not exclude:
-                            # 순중량 및 다른 정보 찾기 (현재 행 근처에서 추출)
-                            # 아래 로직은 일반적인 필증 구조를 따름
+                # (NO.01) 패턴 탐색
+                if "(NO." in row_str:
+                    try:
+                        # 현재 행(row)과 바로 다음 행(row+1)을 병합하여 데이터 누락 방지
+                        # 필증 구조상 모델명이나 수량이 다음 줄에 걸쳐 있는 경우가 많음
+                        next_row = [str(cell).strip() if cell else "" for cell in table[i+1]] if i+1 < len(table) else [""] * len(row)
+                        
+                        # 각 항목별 데이터 추출 (내용이 있는 칸을 우선 탐색)
+                        full_content = " ".join(row) + " " + " ".join(next_row)
+                        full_content = full_content.replace('\n', ' ')
+
+                        # FOC 판별 및 제외 키워드
+                        if "FREE OF CHARGE" in full_content.upper() and not any(ex in full_content.upper() for ex in ['CANISTER', 'DRUM']):
+                            
+                            # 모델명 추출: (NO.01) 뒤의 텍스트
+                            model_match = re.search(r'\(NO\.\d+\)\s*(.*)', full_content)
+                            model_name = model_match.group(1).split('㉛')[0].strip() if model_match else "확인불가"
+
+                            # 수량 추출: 숫자 + (BO) 또는 (GT) 등 단위 패턴
+                            qty_match = re.search(r'(\d+)\s*\((BO|GT|KG|EA)\)', full_content)
+                            qty = qty_match.group(0) if qty_match else "확인불가"
+
+                            # 순중량 추출: (36)번 근처 숫자
+                            weight_match = re.search(r'([\d,.]+)\s*\(KG\)', full_content)
+                            weight = weight_match.group(0) if weight_match else "란 합산치 참조"
+
+                            # 금액(USD) 추출
+                            usd_match = re.search(r'(?:USD|\$)\s?([\d,.]+)', full_content)
+                            price = f"USD {usd_match.group(1)}" if usd_match else "미확인"
+
                             results.append({
                                 "파일명": uploaded_file.name,
                                 "수출신고번호": current_sin_go_no,
                                 "거래구분": "11",
-                                "란-번호": re.search(r'\(NO\.\d+\)', model_info).group() if "(NO." in model_info else "확인불가",
-                                "모델ㆍ규격": model_info.split(')')[-1].strip(),
-                                "수량(단위)": qty_info,
-                                "순중량": "하단 참조", # 표 구조에 따라 다음 줄에 있을 수 있음
-                                "신고가격(FOB)": f"USD {price_info}",
-                                "FOC여부": True
+                                "란-번호": re.search(r'\(NO\.\d+\)', full_content).group() if "(NO." in full_content else "확인",
+                                "모델ㆍ규격": model_name,
+                                "수량(단위)": qty,
+                                "순중량": weight,
+                                "신고가격(FOB)": price,
                             })
-                    except:
+                    except Exception:
                         continue
 
     return results
 
 def main():
-    st.title('📦 수출신고필증 FOC 상세 추출기 (전자 PDF용)')
-    st.info("텍스트 선택이 가능한 전자 PDF에 최적화된 버전입니다.")
+    st.title('📦 수출신고필증 FOC 상세 추출기 (보정 버전)')
+    st.info("표 구조가 복잡한 필증의 데이터를 줄바꿈과 상관없이 병합하여 추출합니다.")
 
     with st.sidebar:
         st.header("📂 파일 업로드")
-        uploaded_files = st.file_uploader("PDF 파일을 선택하세요", type=['pdf'], accept_multiple_files=True)
+        uploaded_files = st.file_uploader("전자 PDF 파일을 선택하세요", type=['pdf'], accept_multiple_files=True)
 
     if uploaded_files:
         all_rows = []
@@ -83,22 +94,17 @@ def main():
             all_rows.extend(data)
         
         if all_rows:
-            df = pd.DataFrame(all_rows)
-            st.subheader("✅ 추출된 FOC 리스트")
+            df = pd.DataFrame(all_rows).drop_duplicates()
+            st.subheader("✅ 최종 추출 결과")
+            # Streamlit 최신 버전 규격 적용
+            st.dataframe(df, width='stretch', hide_index=True)
             
-            # 불필요한 컬럼 제외하고 보여주기
-            display_cols = ['파일명', '수출신고번호', '거래구분', '란-번호', '모델ㆍ규격', '수량(단위)', '신고가격(FOB)']
-            st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-            
-            # 엑셀 다운로드 기능
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                df[display_cols].to_excel(writer, index=False)
-            st.download_button("📊 엑셀 다운로드", output.getvalue(), "FOC_Report.xlsx")
+                df.to_excel(writer, index=False)
+            st.download_button("📊 엑셀 다운로드", output.getvalue(), "FOC_Final_Report.xlsx")
         else:
-            st.warning("FOC(FREE OF CHARGE) 항목을 찾지 못했습니다. 표 구조를 다시 확인해야 할 수 있습니다.")
-    else:
-        st.info("왼쪽 사이드바에서 PDF 파일을 업로드해주세요.")
+            st.warning("FOC 항목을 찾지 못했습니다. PDF가 스캔 이미지가 아닌 '전자문서'인지 확인해주세요.")
 
 if __name__ == '__main__':
     main()
